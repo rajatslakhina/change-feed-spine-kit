@@ -21,6 +21,25 @@ public struct AgentEntityChange: Hashable, Sendable, Identifiable {
     public let final: Record?
     /// Only the fields the agent itself changed, sorted by name.
     public let fieldDiffs: [FieldDiff]
+    /// Someone else wrote this entity between two of the agent's writes. For an entity the
+    /// agent created, that makes deleting it on undo unsafe (it would erase their write).
+    public let foreignWritesDuringSession: Bool
+
+    public init(
+        key: EntityKey,
+        net: Net,
+        original: Record?,
+        final: Record?,
+        fieldDiffs: [FieldDiff],
+        foreignWritesDuringSession: Bool = false
+    ) {
+        self.key = key
+        self.net = net
+        self.original = original
+        self.final = final
+        self.fieldDiffs = fieldDiffs
+        self.foreignWritesDuringSession = foreignWritesDuringSession
+    }
 
     public var id: EntityKey { key }
 }
@@ -117,6 +136,38 @@ public enum AgentAudit {
             var lastAfter: Record?
             var originals: [String: String?] = [:]
             var finals: [String: String?] = [:]
+            var foreignWrites = false
+        }
+
+        /// Someone else wrote this entity between two agent writes. Their write is theirs:
+        /// the agent's net contribution is re-measured from what they left behind.
+        func rebase(_ accumulator: inout Accumulator, onto before: Record?) {
+            guard accumulator.lastAfter != before else { return }
+            accumulator.foreignWrites = true
+            guard let before, let agentLeft = accumulator.lastAfter else {
+                // The entity was created or deleted by someone else in between: nothing the
+                // agent did earlier to this entity survives, so start over from here.
+                accumulator = Accumulator(firstBefore: before, foreignWrites: true)
+                return
+            }
+            for (field, _) in accumulator.originals where before[field] != agentLeft[field] {
+                // The agent's earlier value for this field was overwritten: it is no longer
+                // the agent's to revert unless the agent writes the field again.
+                accumulator.originals[field] = .some(before[field])
+                accumulator.finals[field] = .some(before[field])
+            }
+        }
+
+        func netDiffs(_ accumulator: Accumulator) -> [FieldDiff] {
+            var diffs: [FieldDiff] = []
+            for field in accumulator.originals.keys.sorted() {
+                let before: String? = accumulator.originals[field] ?? nil
+                let after: String? = accumulator.finals[field] ?? nil
+                if before != after {
+                    diffs.append(FieldDiff(field: field, before: before, after: after))
+                }
+            }
+            return diffs
         }
 
         var order: [EntityKey] = []
@@ -129,20 +180,15 @@ public enum AgentAudit {
                 var accumulator: Accumulator
                 if let existing = accumulators[change.key] {
                     accumulator = existing
+                    rebase(&accumulator, onto: change.before)
                 } else {
                     accumulator = Accumulator(firstBefore: change.before)
                     order.append(change.key)
                 }
+                for field in change.changedFields where !accumulator.originals.keys.contains(field) {
+                    accumulator.originals[field] = .some(change.before?[field])
+                }
                 for field in change.changedFields {
-                    let valueBefore = change.before?[field]
-                    if !accumulator.originals.keys.contains(field) {
-                        accumulator.originals[field] = .some(valueBefore)
-                    } else if let agentLast = accumulator.finals[field], agentLast != valueBefore {
-                        // Someone else wrote this field between two agent writes. That write
-                        // is theirs, not the agent's: the agent's net contribution now starts
-                        // from it, so an undo restores their value instead of erasing it.
-                        accumulator.originals[field] = .some(valueBefore)
-                    }
                     accumulator.finals[field] = .some(change.after?[field])
                 }
                 accumulator.lastBefore = change.before
@@ -161,8 +207,12 @@ public enum AgentAudit {
                 continue // created and deleted within the session: no net effect
             case (false, true):
                 let final = accumulator.lastAfter ?? Record()
-                let diffs = final.fields.keys.sorted().map { FieldDiff(field: $0, before: nil, after: final[$0]) }
-                changes.append(AgentEntityChange(key: key, net: .insert, original: nil, final: final, fieldDiffs: diffs))
+                // Only fields the agent itself wrote (a foreign write in between is not the agent's).
+                let diffs = netDiffs(accumulator)
+                changes.append(AgentEntityChange(
+                    key: key, net: .insert, original: nil, final: final, fieldDiffs: diffs,
+                    foreignWritesDuringSession: accumulator.foreignWrites
+                ))
             case (true, false):
                 // Restore = the record just before deletion, with the agent's own edits rolled back.
                 var restored = accumulator.lastBefore ?? Record()
@@ -170,20 +220,19 @@ public enum AgentAudit {
                     restored[field] = original
                 }
                 let diffs = restored.fields.keys.sorted().map { FieldDiff(field: $0, before: restored[$0], after: nil) }
-                changes.append(AgentEntityChange(key: key, net: .delete, original: restored, final: nil, fieldDiffs: diffs))
+                changes.append(AgentEntityChange(
+                    key: key, net: .delete, original: restored, final: nil, fieldDiffs: diffs,
+                    foreignWritesDuringSession: accumulator.foreignWrites
+                ))
             case (true, true):
-                var diffs: [FieldDiff] = []
-                for field in accumulator.originals.keys.sorted() {
-                    let before: String? = accumulator.originals[field] ?? nil
-                    let after: String? = accumulator.finals[field] ?? nil
-                    if before != after {
-                        diffs.append(FieldDiff(field: field, before: before, after: after))
-                    }
-                }
+                let diffs = netDiffs(accumulator)
                 guard !diffs.isEmpty else { continue }
                 var original = accumulator.lastAfter ?? Record()
                 for diff in diffs { original[diff.field] = diff.before }
-                changes.append(AgentEntityChange(key: key, net: .update, original: original, final: accumulator.lastAfter, fieldDiffs: diffs))
+                changes.append(AgentEntityChange(
+                    key: key, net: .update, original: original, final: accumulator.lastAfter, fieldDiffs: diffs,
+                    foreignWritesDuringSession: accumulator.foreignWrites
+                ))
             }
         }
         return AgentSessionReport(session: session, tokens: tokens, changes: changes)
@@ -205,7 +254,7 @@ public enum AgentAudit {
                     alreadyReverted.append(change.key)
                     continue
                 }
-                if live == change.final {
+                if live == change.final, !change.foreignWritesDuringSession {
                     operations.append(.delete(change.key))
                 } else {
                     conflicts.append(UndoConflict(key: change.key, field: nil, reason: .modifiedSinceInsert))
