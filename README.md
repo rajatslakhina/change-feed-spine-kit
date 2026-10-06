@@ -60,7 +60,7 @@ The dependency direction is enforced by `Package.swift`: `ChangeFeed` cannot imp
 5. **Cursor expiry rebuilds from a snapshot; it never "catches up approximately."** When history is pruned past a lane's cursor, the lane calls `rebuild(from:)` with a snapshot that is consistent with an exact token, then follows the stream from that token. The outbox's rebuild queues a *full resync* marker rather than pretending it can reconstruct individual uploads.
 6. **`.fromHead` cursors are persisted immediately.** Otherwise a relaunch would re-resolve "head" and silently skip everything committed while the app was dead. A zero cursor is *not* written, because "no stored cursor" already means "replay from the start".
 7. **The dispatcher holds no state worth losing.** It is the component most likely to be torn down (relaunch, BGTask expiry), so all delivery state lives in lanes and the cursor store. *Trade-off:* `pumpAll()` returns when its slowest lane returns; hosts that cannot accept that drive lanes individually with `pump(_:)`.
-8. **Agent undo only touches fields that still hold the agent's value.** The audit computes the agent's *net field-level* changes (a user edit interleaved mid-session is not attributed to the agent — on another field it is simply left alone, and on the same field the agent's net change is measured from the user's value, so undo restores the user's edit rather than the pre-session value); the planner restores only fields where `current == agent's value` and reports every other case as an `UndoConflict`. `UndoVerifier` checks that safety property for *any* set of operations, independently of how they were produced. *Rejected:* restoring before-images wholesale — it destroys later user edits, and a test shows the verifier catching exactly that.
+8. **Agent undo only touches fields that still hold the agent's value.** The audit computes the agent's *net field-level* changes (a write by someone else *between two agent writes* is not attributed to the agent: the agent's net change is re-measured from what that write left behind, so undo restores the other person's value rather than the pre-session one; if they created or deleted the entity in between, only the agent's work after that point counts; and an entity the agent created but someone else then edited is reported as a conflict instead of being deleted); the planner restores only fields where `current == agent's value` and reports every other case as an `UndoConflict`. `UndoVerifier` checks that safety property for *any* set of operations, independently of how they were produced. *Rejected:* restoring before-images wholesale — it destroys later user edits, and a test shows the verifier catching exactly that. *Known limit:* safety is judged by **value**, so if someone else writes a field and later sets it back to exactly the agent's value, the field counts as the agent's again (an ABA case). Closing that would need a version or last-writer token per field in the store — rejected here as too heavy for a history format the app does not own.
 9. **A partial audit is an error, not a result.** If any of an agent session was pruned, `AgentAudit.report` throws `historyPruned` instead of returning a diff that looks complete.
 
 ### What is deliberately not here
@@ -90,7 +90,7 @@ if plan.isComplete { await store.commit(author: .user, plan.operations) }
 
 ## Tests
 
-`swift test` runs 52 XCTest cases across five suites. Besides edge cases (empty feeds, limits ≤ 0, cursors beyond head, `UInt64.max` tokens, `Int.max` retry attempts, clamped nonsense configuration), the suite includes tests built to **fail against a broken implementation**:
+`swift test` runs 55 XCTest cases across five suites. Besides edge cases (empty feeds, limits ≤ 0, cursors beyond head, `UInt64.max` tokens, `Int.max` retry attempts, clamped nonsense configuration), the suite includes tests built to **fail against a broken implementation**:
 
 - `testWithoutTheAuthorFilterTheEchoLoopNeverTerminates` — the outbox with its filter removed uploads `[1, 1, 1, 1, 1]` across five round trips; the guarded one uploads `[1, 0, 0, 0, 0]`.
 - `testVerifierCatchesANaiveWholesaleRestore` — `UndoVerifier` flags a naive before-image restore that clobbers a user's post-session edit.
@@ -105,12 +105,12 @@ Each of these was checked by mutation: removing the reentrancy guard, the poison
 
 What was actually checked, and what was not:
 
-- **Local (Swift 6.0.3, Linux):** a clean `swift build -Xswiftc -warnings-as-errors` from a deleted `.build` (0 warnings), and `swift test -Xswiftc -warnings-as-errors`: **52 tests, 0 failures**.
+- **Local (Swift 6.0.3, Linux):** a clean `swift build -Xswiftc -warnings-as-errors` from a deleted `.build` (0 warnings), and `swift test -Xswiftc -warnings-as-errors`: **55 tests, 0 failures**.
 - **CI ([Actions](https://github.com/rajatslakhina/change-feed-spine-kit/actions)), on every push to `main`:**
   - *Linux* — `swift:6.0` container: `swift build` and `swift test`, both with `-warnings-as-errors`. `ChangeFeedUI` compiles to nothing on Linux (it is behind `#if canImport(SwiftUI)`).
   - *Apple* — `macos-15`: `swift build` (this is where `ChangeFeedUI` is compiled, for macOS), `swift test`, and `xcodebuild build -scheme ChangeFeedSpine-Package -destination 'generic/platform=iOS Simulator'`, which compiles every module for iOS.
 - **Mutation-checked:** the seven mutations listed under *Tests* each make at least one test fail.
-- **Independent review:** an automated reviewer with no part in writing the code checked the source, tests and READMEs. Its findings were fixed before release; they included a false undo conflict, undo erasing a user edit made mid-session, and an untested transient-failure path.
+- **Independent review:** an automated reviewer with no part in writing the code checked the source, tests and READMEs. Every finding it raised was fixed. They included a false undo conflict, undo erasing a user edit made mid-session, undo deleting an agent-created entity a user had edited (fixed in 1.0.1), and an untested transient-failure path.
 - **Not done:** nothing here has been run on an iOS Simulator or a device. The companion demo app **compiles** for the iOS Simulator in its own CI, which also resolves this package from GitHub at `1.0.0`. It has **not** been launched, and no screenshots exist.
 
 ## License
