@@ -6,7 +6,7 @@ Most iOS apps keep their side systems in sync with ad-hoc plumbing: a `Notificat
 
 iOS 27's SwiftData `HistoryObserver` finally gives apps a first-party change feed (persistent-history transactions with a monotonic event counter and author filtering). This package is the **change-data-capture spine** you put on top of it: a single history stream fanned out to independent lanes, each with its own durable cursor, back-pressure budget, retry policy, poison quarantine and snapshot-rebuild path — plus an agent audit that answers "what did the agent change?" from the stream itself and plans a conflict-checked undo.
 
-> Demo app: (added after the companion repo is pushed)
+> **Demo app:** [change-feed-spine-kit-demo-app](https://github.com/rajatslakhina/change-feed-spine-kit-demo-app) — a SwiftUI console that consumes this package as a version-pinned remote dependency and lets you poison a lane, burst past retention, and audit/undo an agent session.
 
 ## Why this matters
 
@@ -65,7 +65,7 @@ The dependency direction is enforced by `Package.swift`: `ChangeFeed` cannot imp
 
 ### What is deliberately not here
 
-- **The SwiftData adapter itself.** `HistoryObserver` is an iOS 27 SDK API, and this repo's CI builds with the `macos-15` runner image's default Xcode rather than an iOS 27 SDK. Rather than ship an adapter that no CI run has ever compiled, the package stops at the port: `HistorySource` mirrors the shape the adapter needs (monotonic token, one author per transaction, history pruning) and `InMemoryHistoryStore` implements the same contract. A SwiftData adapter would be a single type implementing `HistorySource`; **it is not in this repo.**
+- **The SwiftData adapter itself.** `HistoryObserver` is an iOS 27 SDK API, and this repo's CI builds with the `macos-15` runner image's default Xcode (16.4 at the time of the 1.0.0 release), which has no iOS 27 SDK. Rather than ship an adapter that no CI run has ever compiled, the package stops at the port: `HistorySource` mirrors the shape the adapter needs (monotonic token, one author per transaction, history pruning) and `InMemoryHistoryStore` implements the same contract. A SwiftData adapter would be a single type implementing `HistorySource`; **it is not in this repo.**
 - **Cross-lane ordering.** Lanes are independent by design; nothing orders lane A's delivery relative to lane B's.
 
 ## Using it
@@ -103,7 +103,15 @@ Each of these was checked by mutation: removing the reentrancy guard, the poison
 
 ## Verification
 
-(Filled in from real CI results after the push.)
+What was actually checked, and what was not:
+
+- **Local (Swift 6.0.3, Linux):** a clean `swift build -Xswiftc -warnings-as-errors` from a deleted `.build` (0 warnings), and `swift test -Xswiftc -warnings-as-errors`: **52 tests, 0 failures**.
+- **CI ([Actions](https://github.com/rajatslakhina/change-feed-spine-kit/actions)), on every push to `main`:**
+  - *Linux* — `swift:6.0` container: `swift build` and `swift test`, both with `-warnings-as-errors`. `ChangeFeedUI` compiles to nothing on Linux (it is behind `#if canImport(SwiftUI)`).
+  - *Apple* — `macos-15`: `swift build` (this is where `ChangeFeedUI` is compiled, for macOS), `swift test`, and `xcodebuild build -scheme ChangeFeedSpine-Package -destination 'generic/platform=iOS Simulator'`, which compiles every module for iOS.
+- **Mutation-checked:** the seven mutations listed under *Tests* each make at least one test fail.
+- **Independent review:** an automated reviewer with no part in writing the code checked the source, tests and READMEs. Its findings were fixed before release; they included a false undo conflict, undo erasing a user edit made mid-session, and an untested transient-failure path.
+- **Not done:** nothing here has been run on an iOS Simulator or a device. The companion demo app **compiles** for the iOS Simulator in its own CI, which also resolves this package from GitHub at `1.0.0`. It has **not** been launched, and no screenshots exist.
 
 ## License
 
