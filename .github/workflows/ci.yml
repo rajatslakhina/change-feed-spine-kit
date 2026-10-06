@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build (core + adapters; the SwiftUI module compiles to nothing on Linux)
         run: swift build -Xswiftc -warnings-as-errors
       - name: Test
@@ -22,7 +22,7 @@ jobs:
     name: macOS 15 · swift test + iOS Simulator build
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build all modules for macOS (includes ChangeFeedUI)
         run: swift build
       - name: Test
