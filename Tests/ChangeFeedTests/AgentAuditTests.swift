@@ -144,6 +144,65 @@ final class AgentAuditTests: XCTestCase {
         XCTAssertEqual(after?["body"], "oat milk", "the user's mid-session edit survives the undo")
     }
 
+    /// The agent creates a note, the user edits it, the agent edits it again. Deleting the
+    /// note on undo would erase the user's edit, so the planner must refuse.
+    func testUndoOfAnInsertTheUserBuiltOnIsAConflictNotADelete() async throws {
+        let store = InMemoryHistoryStore()
+        await store.commit(author: .agent("s"), [.put(note("x"), Record(["a": "1"]))])
+        await store.commit(author: .user, [.patch(note("x"), set: ["a": "USER"])])
+        await store.commit(author: .agent("s"), [.patch(note("x"), set: ["b": "7"])])
+
+        let report = try await AgentAudit.report(session: "s", source: store)
+        let change = try XCTUnwrap(report.changes.first)
+        XCTAssertEqual(change.net, .insert)
+        XCTAssertTrue(change.foreignWritesDuringSession)
+        XCTAssertEqual(change.fieldDiffs, [FieldDiff(field: "b", before: nil, after: "7")], "the user's a=USER is not attributed to the agent")
+
+        let current = await store.snapshot()
+        let plan = AgentAudit.undoPlan(for: report, current: current)
+        XCTAssertFalse(plan.operations.contains(.delete(note("x"))))
+        XCTAssertEqual(plan.conflicts, [UndoConflict(key: note("x"), field: nil, reason: .modifiedSinceInsert)])
+        XCTAssertEqual(UndoVerifier.foreignOverwrites(operations: [.delete(note("x"))], report: report, current: current)[note("x")], ["a"],
+                       "the verifier flags a delete that would erase the user's field")
+    }
+
+    /// The agent deletes a note, the user recreates it, the agent edits the recreation.
+    /// Only the last edit is the agent's; nothing from the note's previous life is restored.
+    func testDeleteRecreateEditOnlyAttributesTheEditAfterRecreation() async throws {
+        let store = InMemoryHistoryStore()
+        await store.commit(author: .user, [.put(note("x"), Record(["a": "1", "b": "2"]))])
+        await store.commit(author: .agent("s"), [.delete(note("x"))])
+        await store.commit(author: .user, [.put(note("x"), Record(["a": "5"]))])
+        await store.commit(author: .agent("s"), [.patch(note("x"), set: ["a": "6"])])
+
+        let report = try await AgentAudit.report(session: "s", source: store)
+        let change = try XCTUnwrap(report.changes.first)
+        XCTAssertEqual(change.net, .update)
+        XCTAssertEqual(change.fieldDiffs, [FieldDiff(field: "a", before: "5", after: "6")])
+        let current = await store.snapshot()
+        let plan = AgentAudit.undoPlan(for: report, current: current)
+        XCTAssertEqual(plan.operations, [.patch(note("x"), set: ["a": "5"], remove: [])], "b=2 from the deleted life is not written back")
+        XCTAssertTrue(UndoVerifier.foreignOverwrites(operations: plan.operations, report: report, current: current).isEmpty)
+    }
+
+    /// The agent changed a field, the user then overwrote it, and the agent moved on to a
+    /// different field. The first field is no longer the agent's to revert.
+    func testAFieldOverwrittenByTheUserLeavesTheAgentsDiff() async throws {
+        let store = InMemoryHistoryStore()
+        await store.commit(author: .user, [.put(note("x"), Record(["a": "1", "b": "1"]))])
+        await store.commit(author: .agent("s"), [.patch(note("x"), set: ["a": "2"])])
+        await store.commit(author: .user, [.patch(note("x"), set: ["a": "3"])])
+        await store.commit(author: .agent("s"), [.patch(note("x"), set: ["b": "9"])])
+
+        let report = try await AgentAudit.report(session: "s", source: store)
+        let change = try XCTUnwrap(report.changes.first)
+        XCTAssertEqual(change.fieldDiffs, [FieldDiff(field: "b", before: "1", after: "9")])
+        XCTAssertEqual(change.original, Record(["a": "3", "b": "1"]))
+        let plan = AgentAudit.undoPlan(for: report, current: await store.snapshot())
+        XCTAssertEqual(plan.operations, [.patch(note("x"), set: ["b": "1"], remove: [])])
+        XCTAssertTrue(plan.isComplete)
+    }
+
     func testAgentEditOfADeletedEntityConflicts() async throws {
         let store = await seededStore()
         let report = try await AgentAudit.report(session: session, source: store)
